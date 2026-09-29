@@ -600,10 +600,10 @@ function orderTable(list) {
     { label: 'Customer', render: o => custCell(o.customerId) },
     { label: 'Type', render: o => esc(S.orderType(o)) },
     { label: 'Order', render: o => badge(o.state) },
-    { label: 'Production', render: o => o.productionStatus === 'Not Required' ? '<span class="muted">—</span>' : badge(o.productionStatus) },
-    { label: 'Delivery', render: o => badge(o.deliveryStatus) },
-    { label: 'Payment', render: o => badge(o.paymentStatus) },
-    { label: 'Total', cls: 'num', render: o => money(S.orderTotals(o).total) },
+    { label: 'Production', render: o => o.state === 'Cancelled' || o.productionStatus === 'Not Required' ? '<span class="muted">—</span>' : badge(o.productionStatus) },
+    { label: 'Delivery', render: o => o.state === 'Cancelled' ? '<span class="muted">—</span>' : badge(o.deliveryStatus) },
+    { label: 'Payment', render: o => o.state === 'Cancelled' && o.paymentStatus === 'Unpaid' ? '<span class="muted">—</span>' : badge(o.paymentStatus) },
+    { label: 'Total', cls: 'num', render: o => (o.state === 'Cancelled' ? `<s class="muted">${money(S.docTotals(o).total)}</s>` : money(S.orderTotals(o).total)) },
     { label: 'Due', render: o => { const late = o.expectedAt && o.expectedAt < today() && o.state === 'Confirmed' && o.deliveryStatus !== 'Delivered'; return o.expectedAt ? `<span class="${late ? 'bad-text' : ''}">${fmtDate(o.expectedAt)}${late ? ' · late' : ''}</span>` : '—'; } },
   ], list, { href: o => `orders/${o.id}`, empty: 'No orders match these filters.' });
 }
@@ -611,7 +611,9 @@ export function viewOrders() {
   const q = app.query;
   let list = [...db().orders].sort((x, y) => y.createdAt.localeCompare(x.createdAt));
   if (q.type) list = list.filter(o => S.orderType(o) === q.type || (q.type === 'Wholesale' && S.orderType(o) === 'Mixed' && false));
+  const hiddenCancelled = q.state ? 0 : list.filter(o => o.state === 'Cancelled').length;
   if (q.state) list = list.filter(o => o.state === q.state);
+  else list = list.filter(o => o.state !== 'Cancelled'); // cancelled orders are hidden unless you ask for them
   if (q.production) list = list.filter(o => o.productionStatus === q.production);
   if (q.delivery) list = list.filter(o => o.deliveryStatus === q.delivery);
   if (q.payment) list = list.filter(o => o.paymentStatus === q.payment);
@@ -624,7 +626,17 @@ export function viewOrders() {
       { key: 'delivery', label: 'Delivery', options: S.DELIVERY_FLOW },
       { key: 'payment', label: 'Payment', options: ['Unpaid', 'Partially Paid', 'Paid'] },
     ], 'Search orders')}
-    ${orderTable(list)}`);
+    ${hiddenCancelled ? `<p class="muted small">${hiddenCancelled} cancelled order${hiddenCancelled === 1 ? ' is' : 's are'} hidden. <a href="#/orders?state=Cancelled">Show cancelled orders</a></p>` : ''}
+    ${q.state === 'Cancelled' && app.user.role === 'admin' && list.some(o => !S.canDeleteOrder(o)) ? `<div class="callout info small"><p>Cancelled orders are kept for your records. You can permanently delete ones that were mistakes or tests (orders with payments recorded are always kept).</p>${btn('Delete all cancelled orders without payments', 'deleteAllCancelled', 'sm ghost danger-text')}</div>` : ''}
+    ${orderTable(list)}`, {
+    deleteAllCancelled: async () => {
+      const n = db().orders.filter(o => o.state === 'Cancelled' && !S.canDeleteOrder(o)).length;
+      if (await confirmBox(`${n} cancelled order${n === 1 ? '' : 's'} will be permanently deleted, with their invoices and tracking links. This can’t be undone.`, { title: 'Delete cancelled orders?', input: 'Type DELETE to confirm', confirmLabel: 'Delete', danger: true }).then(v => String(v || '').trim().toUpperCase()) !== 'DELETE') return;
+      const done = S.deleteAllCancelledOrders();
+      toast(`${done} cancelled order${done === 1 ? '' : 's'} deleted`);
+      go('orders');
+    },
+  });
 }
 
 export function viewOrderEditor({ id }) {
@@ -723,7 +735,8 @@ export function viewOrder({ id }) {
       `${o.state === 'Draft' && can('orders.create') ? linkBtn('Edit', `orders/${o.id}/edit`, 'ghost') + btn('Confirm order', 'confirm', 'primary') : ''}
        ${['Confirmed', 'Completed'].includes(o.state) ? btn('Message customer', 'message', 'ghost') : ''}${live || o.state === 'Completed' ? btn('Email invoice', 'emailInvoice', 'ghost') + btn('Invoice PDF', 'invoice', 'ghost') + (canShareFiles() ? btn('Share invoice', 'shareinv', 'ghost') : '') : ''}
        ${live && can('payments') && t.balance > 0 ? btn('Record payment', 'pay', 'primary') : ''}
-       ${(o.state === 'Draft' || live) && !o.stockDeducted && can('orders.create') ? btn('Cancel order', 'cancel', 'ghost danger-text') : ''}`)}
+       ${(o.state === 'Draft' || live) && !o.stockDeducted && can('orders.create') ? btn('Cancel order', 'cancel', 'ghost danger-text') : ''}
+       ${o.state === 'Cancelled' && app.user.role === 'admin' ? btn('Delete permanently', 'deleteOrder', 'ghost danger-text') : ''}`)}
     <div class="status-row">
       ${statusCard('Order', o.state)}
       ${statusCard('Production', o.productionStatus, o.productionStatus === 'Not Required' ? '<span class="muted">Not required</span>' : (canStatus ? select('production', S.PRODUCTION_FLOW, o.productionStatus, S.DELIVERY_FLOW.indexOf(o.deliveryStatus) >= 1) : null))}
@@ -787,6 +800,13 @@ export function viewOrder({ id }) {
     </div>`,
   {
     ...mockupActions('order', o),
+    deleteOrder: async () => {
+      const why = S.canDeleteOrder(o);
+      if (why) return toast(why, 'error');
+      if (await confirmBox(`${o.number} will be permanently deleted, with its invoice and tracking link. This can’t be undone.`, { title: 'Delete this order?', input: 'Type DELETE to confirm', confirmLabel: 'Delete', danger: true }).then(v => String(v || '').trim().toUpperCase()) !== 'DELETE') return;
+      toast(`${S.deleteCancelledOrder(o.id)} deleted`);
+      go('orders');
+    },
     bulkQuote: () => { const q = S.bulkQuoteFromSample(o.id); toast(`Bulk quote ${q.number} created with the sample fee deducted — set the bulk quantities and prices`); go(`quotes/${q.id}/edit`); },
     emailInvoice: () => emailModal({ title: `Email invoice for ${o.number}`, draft: S.invoiceEmail(o), doc: S.invoiceDoc(o), docLabel: 'invoice', onSent: () => S.logCustomerMessage(o.id, 'invoice', 'email', 'Invoice') }),
     viewFile: el => openMockup(o.attachments[+el.dataset.i].dataUrl),

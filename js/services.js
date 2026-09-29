@@ -1544,3 +1544,37 @@ export function bulkQuoteFromSample(sampleOrderId) {
   save();
   return q;
 }
+
+// ---------- deleting cancelled orders (admin only) ----------
+// Cancelled orders are kept by default for your records. An admin can remove ones that were
+// mistakes or tests, as long as no money was received on them.
+export function canDeleteOrder(o) {
+  if (!o || o.state !== 'Cancelled') return 'Only cancelled orders can be deleted.';
+  if (db().payments.some(p => p.orderId === o.id && !p.void)) return `${o.number} has payments recorded, so it is kept for your records. Void the payments first if they were mistakes.`;
+  if (o.sampleUsedBy) return `This sample’s fee is deducted on order ${o.sampleUsedBy.number}.`;
+  return '';
+}
+export function deleteCancelledOrder(id) {
+  if (actor.role !== 'admin') throw new Error('Only an admin can delete orders.');
+  const o = get('orders', id);
+  const why = canDeleteOrder(o);
+  if (why) throw new Error(why);
+  const d = db(), total = docTotals(o).total, who = customerName(get('customers', o.customerId));
+  releaseSampleUse(o.id);
+  d.orders = d.orders.filter(x => x.id !== id);
+  d.tracking = d.tracking.filter(t => t.orderId !== id);
+  d.invoices = d.invoices.filter(v => v.orderId !== id);
+  d.payments = d.payments.filter(p => p.orderId !== id); // only voided ones can remain
+  d.qualityChecks = d.qualityChecks.filter(q => q.orderId !== id);
+  d.quotes.forEach(q => { if (q.orderId === id) { q.orderId = null; q.history.push({ at: iso(), text: `Order ${o.number} was cancelled and deleted`, by: actor.name }); } });
+  d.reorders.forEach(r => { if (r.orderId === id) r.orderId = null; });
+  logAudit('Deleted cancelled order', 'order', o.number, `${who} · ${money(total)}`);
+  save();
+  return o.number;
+}
+export function deleteAllCancelledOrders() {
+  if (actor.role !== 'admin') throw new Error('Only an admin can delete orders.');
+  const ids = db().orders.filter(o => o.state === 'Cancelled' && !canDeleteOrder(o)).map(o => o.id);
+  ids.forEach(id => deleteCancelledOrder(id));
+  return ids.length;
+}
